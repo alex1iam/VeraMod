@@ -3,7 +3,7 @@ import re
 import subprocess
 import ctypes
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 import psutil
 
 from main.config_manager import get_config
@@ -275,6 +275,292 @@ def execute_browser_command(text: str) -> Optional[str]:
             return "Открываю браузер по умолчанию."
     except Exception as e:
         return f"Ошибка открытия браузера: {e}"
+
+
+class MailLaunch(NamedTuple):
+    """Как запустить почтовый клиент: argv программы или протокол Windows."""
+
+    argv: tuple = ()
+    protocol: str = ""
+
+
+_MAIL_OPEN_RE = re.compile(
+    r"\b(?:открой(?:те)?|запусти(?:те)?|открыть|запустить)\b",
+    re.IGNORECASE,
+)
+_MAIL_TARGET_RE = re.compile(
+    r"\b(?:почт(?:а|у|е|ы|ой|ою|ов\w*)|e-?mail|mail|мейл|е-?мейл|имейл)\b",
+    re.IGNORECASE,
+)
+# Файл, папка и адрес сайта — не запуск клиента.
+_MAIL_NOT_CLIENT_RE = re.compile(
+    r"(https?://|www\.|\b[\w-]+\.(?:ru|com|net|org|io|рф)\b|\b(?:файл|папк)\w*\b)",
+    re.IGNORECASE,
+)
+_COMPOSE_ARG_RE = re.compile(
+    r"^(?:-compose|-c|/m(?::.*)?|/mailurl(?::.*)?|ipm\.note)$",
+    re.IGNORECASE,
+)
+_PROTOCOL_RE = re.compile(r"^[a-z][a-z0-9+.-]*:$", re.IGNORECASE)
+_WRAPPER_EXES = {
+    "launchwinapp.exe",
+    "rundll32.exe",
+    "explorer.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "hh.exe",
+}
+
+
+def _is_open_mail_request(text: str) -> bool:
+    """Просьба открыть или запустить почту, а не файл, папку или сайт."""
+    lowered = (text or "").lower().strip()
+    if not lowered or not _MAIL_OPEN_RE.search(lowered):
+        return False
+    if not _MAIL_TARGET_RE.search(lowered):
+        return False
+    if _MAIL_NOT_CLIENT_RE.search(lowered):
+        return False
+    return True
+
+
+def _windows_registry():
+    import winreg
+
+    return winreg
+
+
+def _reg_value(reg, hive, path: str, name: str = "") -> Optional[str]:
+    try:
+        with reg.OpenKey(hive, path) as key:
+            value, _type = reg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    text = str(value or "").strip()
+    return text or None
+
+
+def _split_windows_args(rest: str) -> list[str]:
+    args: list[str] = []
+    current: list[str] = []
+    quote = ""
+    for char in rest:
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                current.append(char)
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            continue
+        if char.isspace():
+            if current:
+                args.append("".join(current))
+                current = []
+            continue
+        current.append(char)
+    if current:
+        args.append("".join(current))
+    return args
+
+
+def _expand_windows_command(command: str) -> str:
+    """Раскрывает %VAR% и переменные окружения в команде из реестра."""
+
+    def replace_percent(match: re.Match) -> str:
+        return os.environ.get(match.group(1), match.group(0))
+
+    return os.path.expandvars(re.sub(r"%([^%]+)%", replace_percent, command))
+
+
+def _split_windows_command(command: str) -> list[str]:
+    """Разбирает команду из реестра Windows на исполняемый файл и аргументы."""
+    command = _expand_windows_command(command.strip())
+    if not command:
+        return []
+    if command[0] == '"':
+        end = command.find('"', 1)
+        if end == -1:
+            return [command.strip('"')]
+        exe = command[1:end]
+        return [exe, *_split_windows_args(command[end + 1 :].strip())]
+
+    lower = command.lower()
+    for ext in (".exe", ".bat", ".cmd", ".com"):
+        idx = lower.find(ext)
+        if idx != -1 and (idx + len(ext) == len(command) or command[idx + len(ext)].isspace()):
+            exe = command[: idx + len(ext)].strip().strip('"')
+            return [exe, *_split_windows_args(command[idx + len(ext) :].strip())]
+    return _split_windows_args(command)
+
+
+def _is_compose_arg(arg: str) -> bool:
+    return "%" in arg or bool(_COMPOSE_ARG_RE.match(arg))
+
+
+def _windows_exe_name(path: str) -> str:
+    """Имя файла из пути Windows. Не зависит от ОС, на которой запущен разбор."""
+    normalized = path.replace("/", "\\").rstrip("\\")
+    return normalized.rsplit("\\", 1)[-1].lower()
+
+
+def _normalize_mail_command(command: str) -> MailLaunch:
+    """Превращает команду регистрации клиента в запуск окна, а не нового письма."""
+    parts = _split_windows_command(command)
+    if not parts or not parts[0]:
+        raise ValueError("пустая команда почтового клиента")
+    if _PROTOCOL_RE.match(parts[0]):
+        return MailLaunch(protocol=parts[0])
+
+    exe_name = _windows_exe_name(parts[0])
+    if exe_name in _WRAPPER_EXES:
+        raise LookupError(exe_name)
+    if any(_is_compose_arg(part) for part in parts[1:]):
+        return MailLaunch(argv=(parts[0],))
+    return MailLaunch(argv=tuple(parts))
+
+
+def _protocol_for_handler(prog_id: str, command: str) -> str:
+    blob = f"{prog_id}\n{command}".lower()
+    if "outlookforwindows" in blob or "olk.exe" in blob:
+        return "outlook:"
+    if any(
+        token in blob
+        for token in (
+            "windowscommunicationsapps",
+            "hxoutlook",
+            "windowsmail",
+            "microsoft.windowslive.mail",
+        )
+    ):
+        return "outlookmail:"
+    return "mailto:"
+
+
+def _mailto_user_choice(reg) -> tuple[str, str]:
+    prog_id = _reg_value(
+        reg,
+        reg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\mailto\UserChoice",
+        "ProgId",
+    )
+    if not prog_id:
+        return "", ""
+    command = _reg_value(
+        reg,
+        reg.HKEY_CLASSES_ROOT,
+        rf"{prog_id}\shell\open\command",
+        "",
+    )
+    return prog_id, command or ""
+
+
+def _registered_client_command(reg) -> Optional[str]:
+    """Команда shell\\open клиента из «Программы по умолчанию»."""
+    hives = {
+        "HKCU": reg.HKEY_CURRENT_USER,
+        "HKLM": reg.HKEY_LOCAL_MACHINE,
+    }
+    defaults: list[tuple[str, str]] = []
+    for hive_name, path in (
+        ("HKCU", r"Software\Clients\Mail"),
+        ("HKLM", r"Software\Clients\Mail"),
+        ("HKLM", r"Software\WOW6432Node\Clients\Mail"),
+    ):
+        name = _reg_value(reg, hives[hive_name], path, "")
+        if name and (hive_name, name) not in defaults:
+            defaults.append((hive_name, name))
+
+    for hive_name, name in defaults:
+        hive_order = []
+        for candidate in (hive_name, "HKCU", "HKLM"):
+            if candidate not in hive_order:
+                hive_order.append(candidate)
+        for hive in hive_order:
+            for base in (
+                rf"Software\Clients\Mail\{name}\shell\open\command",
+                rf"Software\WOW6432Node\Clients\Mail\{name}\shell\open\command",
+            ):
+                command = _reg_value(reg, hives[hive], base, "")
+                if command:
+                    return command
+    return None
+
+
+def resolve_default_mail_launch(reg=None) -> MailLaunch:
+    """Находит почтовый клиент, назначенный в Windows по умолчанию."""
+    reg = _windows_registry() if reg is None else reg
+    prog_id, mailto_command = _mailto_user_choice(reg)
+
+    if mailto_command:
+        try:
+            return _normalize_mail_command(mailto_command)
+        except LookupError:
+            return MailLaunch(protocol=_protocol_for_handler(prog_id, mailto_command))
+
+    if prog_id:
+        return MailLaunch(protocol=_protocol_for_handler(prog_id, ""))
+
+    client_command = _registered_client_command(reg)
+    if client_command:
+        try:
+            return _normalize_mail_command(client_command)
+        except LookupError:
+            return MailLaunch(protocol=_protocol_for_handler("", client_command))
+
+    class_command = _reg_value(reg, reg.HKEY_CLASSES_ROOT, r"mailto\shell\open\command", "") or ""
+    if class_command:
+        try:
+            return _normalize_mail_command(class_command)
+        except LookupError:
+            return MailLaunch(protocol=_protocol_for_handler("", class_command))
+
+    return MailLaunch(protocol="mailto:")
+
+
+def _start_mail_process(argv: list[str]) -> None:
+    """Запускает exe. Для app execution alias пробует ShellExecute, если CreateProcess не смог."""
+    try:
+        subprocess.Popen(argv)
+        return
+    except OSError as exc:
+        params = subprocess.list2cmdline(argv[1:]) if len(argv) > 1 else None
+        if _shell_execute(argv[0], params):
+            return
+        startfile = getattr(os, "startfile", None)
+        if startfile is not None and len(argv) == 1:
+            startfile(argv[0])
+            return
+        raise exc
+
+
+def perform_mail_launch(launch: MailLaunch) -> None:
+    """Запускает найденный клиент или его протокол."""
+    if launch.argv:
+        _start_mail_process(list(launch.argv))
+        return
+
+    protocol = launch.protocol or "mailto:"
+    startfile = getattr(os, "startfile", None)
+    if startfile is None:
+        raise OSError("Запуск почтового клиента поддерживается только в Windows")
+    startfile(protocol)
+
+
+def execute_mail_command(text: str) -> Optional[str]:
+    """Открывает почтовый клиент по умолчанию."""
+    if not _is_open_mail_request(text):
+        return None
+
+    try:
+        launch = resolve_default_mail_launch()
+        print(f"[OPEN_MAIL] {launch.argv or launch.protocol}")
+        perform_mail_launch(launch)
+        return "Открываю почтовый клиент по умолчанию."
+    except Exception as e:
+        return f"Ошибка открытия почты: {e}"
 
 
 def execute_rebuild_index_command(text: str) -> Optional[str]:
