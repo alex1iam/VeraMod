@@ -239,6 +239,167 @@ def _close_app(app: dict) -> str:
     return "Закрываю приложение." if any_killed else "Приложение не найдено среди процессов."
 
 
+_OPEN_VERB_RE = re.compile(r"\b(открой|запусти|открыть|запустить)\b", re.IGNORECASE)
+_MAIL_TARGET_RE = re.compile(
+    r"\b("
+    r"почт(?:а|у|е|ы|ой|ами|ам|ах|овый|овая|овое|ового|овому|овым|овых|овые|овом)|"
+    r"e-?mail|"
+    r"е-?мейл|"
+    r"имейл|"
+    r"мэйл|"
+    r"mail"
+    r")\b",
+    re.IGNORECASE,
+)
+_MAIL_NOT_CLIENT_RE = re.compile(r"\b(файл|папк\w*|сайт|документ)\b", re.IGNORECASE)
+# Хосты, которые только передают протокол mailto: и сами почтой не являются.
+_PROTOCOL_HOSTS = {
+    "explorer.exe",
+    "rundll32.exe",
+    "launchwinapp.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "hh.exe",
+    "openwith.exe",
+}
+
+
+def _is_open_mail_request(text: str) -> bool:
+    """Команда открыть почтовый клиент, а не файл, папку или сайт."""
+    if not _OPEN_VERB_RE.search(text):
+        return False
+    if _MAIL_NOT_CLIENT_RE.search(text):
+        return False
+    return _MAIL_TARGET_RE.search(text) is not None
+
+
+def _parse_shell_command(command: str) -> list[str]:
+    """Разбирает командную строку из реестра Windows."""
+    args: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    for ch in command.strip():
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                buf.append(ch)
+            continue
+        if ch in "\"'":
+            quote = ch
+            continue
+        if ch.isspace():
+            if buf:
+                args.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        args.append("".join(buf))
+    return [os.path.expandvars(part) for part in args if part]
+
+
+def _registry_default(root, subkey: str) -> Optional[str]:
+    import winreg
+
+    try:
+        with winreg.OpenKey(root, subkey) as key:
+            value, _ = winreg.QueryValueEx(key, "")
+    except OSError:
+        return None
+    text = str(value or "").strip()
+    return text or None
+
+
+def _read_mailto_command() -> Optional[str]:
+    """Команда обработчика mailto:, которого пользователь выбрал в Windows."""
+    import winreg
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\mailto\UserChoice",
+        ) as key:
+            prog_id = str(winreg.QueryValueEx(key, "ProgId")[0] or "").strip()
+    except OSError:
+        return None
+    if not prog_id:
+        return None
+    return _registry_default(winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\shell\open\command")
+
+
+def _read_clients_mail_command() -> Optional[str]:
+    """Команда запуска клиента из списка программ по умолчанию."""
+    import winreg
+
+    client = (
+        _registry_default(winreg.HKEY_CURRENT_USER, r"Software\Clients\Mail")
+        or _registry_default(winreg.HKEY_LOCAL_MACHINE, r"Software\Clients\Mail")
+    )
+    if not client:
+        return None
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        command = _registry_default(root, rf"Software\Clients\Mail\{client}\shell\open\command")
+        if command:
+            return command
+    return None
+
+
+def _windows_exe_name(path: str) -> str:
+    """Имя файла из пути Windows. Не зависит от разделителей текущей ОС."""
+    normalized = path.replace("/", "\\").rstrip("\\")
+    return normalized.rsplit("\\", 1)[-1].lower()
+
+
+def _launch_mail_command(command: str) -> bool:
+    """Запускает клиент. Протокольные хосты вроде explorer.exe не подходят."""
+    argv = _parse_shell_command(command)
+    if not argv:
+        return False
+    exe_name = _windows_exe_name(argv[0])
+    if exe_name in _PROTOCOL_HOSTS:
+        if any(part.lower().startswith("shell:appsfolder") for part in argv):
+            subprocess.Popen(argv)
+            return True
+        return False
+    subprocess.Popen([argv[0]])
+    return True
+
+
+def _open_mailto_protocol() -> None:
+    startfile = getattr(os, "startfile", None)
+    if startfile is None:
+        raise OSError("Почтовый клиент по умолчанию доступен только в Windows")
+    startfile("mailto:")
+
+
+def _launch_default_mail_client() -> None:
+    """Открывает почтовый клиент, назначенный в Windows по умолчанию."""
+    user_choice = _read_mailto_command()
+    if user_choice:
+        if _launch_mail_command(user_choice):
+            return
+        _open_mailto_protocol()
+        return
+
+    client_command = _read_clients_mail_command()
+    if client_command and _launch_mail_command(client_command):
+        return
+    _open_mailto_protocol()
+
+
+def execute_mail_command(text: str) -> Optional[str]:
+    """Открывает почтовый клиент по умолчанию."""
+    if not _is_open_mail_request(text):
+        return None
+    try:
+        _launch_default_mail_client()
+    except Exception as e:
+        return f"Ошибка открытия почты: {e}"
+    return "Открываю почтовый клиент по умолчанию."
+
+
 def execute_browser_command(text: str) -> Optional[str]:
     """Открывает браузер по умолчанию."""
     lowered = text.lower().strip()
