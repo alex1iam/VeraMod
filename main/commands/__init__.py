@@ -2,6 +2,7 @@ from .app_control import (
     execute_predefined_command,
     execute_app_command,
     execute_browser_command,
+    execute_mail_command,
     execute_rebuild_index_command,
     execute_coin_flip_command,
 )
@@ -105,6 +106,7 @@ HANDLERS = (
     # Приложения
     execute_predefined_command,
     execute_browser_command,
+    execute_mail_command,
     execute_rebuild_index_command,
     execute_app_command,
     
